@@ -25,7 +25,7 @@ public class OrderService {
     private final Counter ordersCreated;
 
     public OrderService(MeterRegistry registry) {
-        this.ordersCreated = Counter.builder("orders.created")
+        this.ordersCreated = Counter.builder("orders.placed")
                 .description("Number of orders created")
                 .register(registry);
     }

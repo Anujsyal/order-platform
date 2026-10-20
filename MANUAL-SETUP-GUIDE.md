@@ -1227,7 +1227,7 @@ sum by (status) (rate(http_server_requests_seconds_count{namespace="order-servic
 slo:sli_error:ratio_rate1h                          # SLI recording rules
 slo:error_budget_remaining:ratio7d                  # kitna budget bacha
 histogram_quantile(0.95, sum by (le) (rate(http_server_requests_seconds_bucket{namespace="order-service"}[5m])))
-orders_created_total
+orders_placed_total
 ALERTS{alertstate="firing"}
 ```
 
