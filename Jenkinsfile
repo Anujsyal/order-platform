@@ -112,10 +112,13 @@ pipeline {
         stage('Push Image') {
             steps {
                 withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                    // Throwaway DOCKER_CONFIG: the login never lands in ~jenkins/.docker, so a
+                    // failed push can't leave stale credentials that break later base-image pulls.
                     sh '''
+                        export DOCKER_CONFIG="$(mktemp -d)"
+                        trap 'rm -rf "$DOCKER_CONFIG"' EXIT
                         echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
                         docker push "$IMAGE_REPO:$IMAGE_TAG"
-                        docker logout
                     '''
                 }
             }
