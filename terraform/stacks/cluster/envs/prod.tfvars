@@ -1,0 +1,10 @@
+environment          = "prod"
+aws_region           = "ap-south-1"
+project              = "order-platform"
+state_bucket         = "anujsyal-order-platform-tfstate"
+admin_cidr           = "122.161.52.142/32"
+key_name             = "order-platform-key"
+master_instance_type = "c7i-flex.large"
+worker_instance_type = "m7i-flex.large"
+worker_count         = 3
+gitops_repo_url      = "https://github.com/Anujsyal/order-platform-gitops.git"

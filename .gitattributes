@@ -1,0 +1,4 @@
+# Force LF everywhere - shell scripts and EC2 user-data break with Windows CRLF.
+* text=auto eol=lf
+*.jar binary
+*.png binary

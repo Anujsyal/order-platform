@@ -1,0 +1,22 @@
+# The GitOps manifests live in their own repo (order-platform-gitops).
+gitops/
+
+# Java
+app/target/
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.plan.json
+*.plan.txt
+crash.log
+
+# Pipeline scratch
+.promote/
+
+# Secrets - never commit
+*.pem
+*.key
+.env

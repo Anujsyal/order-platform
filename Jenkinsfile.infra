@@ -1,0 +1,109 @@
+// Infrastructure pipeline: the SAME Terraform code is planned, policy-checked
+// and applied to dev, then (after approval) staging, then (after approval) prod.
+//
+// AWS access comes from the Jenkins EC2 instance profile (no keys in Jenkins).
+// The shared stack (VPC + Jenkins itself) is applied from your laptop, not here.
+
+// Best-effort Slack notification (credential 'slack-webhook', Secret text).
+def notifySlack(String text) {
+    try {
+        withCredentials([string(credentialsId: 'slack-webhook', variable: 'SLACK_WEBHOOK')]) {
+            writeFile file: '.slack.json', text: groovy.json.JsonOutput.toJson([text: text])
+            sh 'curl -fsS -X POST -H "Content-Type: application/json" --data @.slack.json "$SLACK_WEBHOOK" > /dev/null'
+        }
+    } catch (err) {
+        echo "Slack notification skipped: ${err.getMessage()}"
+    }
+}
+
+def tfInit(String envName) {
+    sh """
+        terraform init -input=false -reconfigure \
+          -backend-config=../../backend.hcl \
+          -backend-config=key=cluster/${envName}/terraform.tfstate
+    """
+}
+
+def tfPlan(String envName) {
+    dir('terraform/stacks/cluster') {
+        tfInit(envName)
+        sh """
+            terraform plan -input=false -var-file=envs/${envName}.tfvars -out=${envName}.tfplan
+            terraform show -no-color ${envName}.tfplan > ${envName}.plan.txt
+            terraform show -json ${envName}.tfplan > ${envName}.plan.json
+        """
+        // Policy-as-code gate: any deny in policies/terraform fails the build.
+        sh "conftest test ${envName}.plan.json --policy ../../../policies/terraform"
+        archiveArtifacts artifacts: "${envName}.plan.txt", fingerprint: true
+    }
+}
+
+def tfApply(String envName) {
+    dir('terraform/stacks/cluster') {
+        tfInit(envName)
+        sh "terraform apply -input=false ${envName}.tfplan"
+    }
+}
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+    }
+
+    environment {
+        TF_IN_AUTOMATION = 'true'
+        APPROVERS        = 'admin'
+    }
+
+    stages {
+        stage('Validate') {
+            steps {
+                dir('terraform') {
+                    sh 'terraform fmt -check -recursive'
+                }
+                dir('terraform/stacks/cluster') {
+                    sh 'terraform init -input=false -backend=false && terraform validate'
+                }
+            }
+        }
+
+        stage('Plan: dev')  { steps { script { tfPlan('dev') } } }
+        stage('Apply: dev') { steps { script { tfApply('dev') } } }
+
+        stage('Plan: staging') { steps { script { tfPlan('staging') } } }
+        stage('Approval: staging') {
+            options { timeout(time: 4, unit: 'HOURS') }
+            steps {
+                script { notifySlack(":hourglass: Terraform plan for *staging* passed policy checks and is waiting for approval: <${env.BUILD_URL}artifact/staging.plan.txt|Plan> / <${env.BUILD_URL}input|Approve>") }
+                input message: 'Apply the archived staging plan (staging.plan.txt)?', ok: 'Apply', submitter: env.APPROVERS
+            }
+        }
+        stage('Apply: staging') { steps { script { tfApply('staging') } } }
+
+        stage('Plan: prod') { steps { script { tfPlan('prod') } } }
+        stage('Approval: prod') {
+            options { timeout(time: 24, unit: 'HOURS') }
+            steps {
+                script { notifySlack(":hourglass: Terraform plan for *prod* passed policy checks and is waiting for approval: <${env.BUILD_URL}artifact/prod.plan.txt|Plan> / <${env.BUILD_URL}input|Approve>") }
+                input message: 'Apply the archived PROD plan (prod.plan.txt)?', ok: 'Apply to prod', submitter: env.APPROVERS
+            }
+        }
+        stage('Apply: prod') { steps { script { tfApply('prod') } } }
+    }
+
+    post {
+        success {
+            script { notifySlack(":white_check_mark: Infra pipeline <${env.BUILD_URL}|#${env.BUILD_NUMBER}> applied dev -> staging -> prod.") }
+        }
+        failure {
+            script { notifySlack(":x: Infra pipeline <${env.BUILD_URL}|#${env.BUILD_NUMBER}> failed (plan, policy check or apply) - see the red stage.") }
+        }
+        always {
+            cleanWs()
+        }
+    }
+}

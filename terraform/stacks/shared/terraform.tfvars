@@ -1,0 +1,7 @@
+aws_region            = "ap-south-1"
+project               = "order-platform"
+admin_cidr            = "122.161.52.142/32"
+key_name              = "order-platform-key"
+jenkins_instance_type = "c7i-flex.large"
+state_bucket          = "anujsyal-order-platform-tfstate"
+alert_email           = "anujsyal7@gmail.com"

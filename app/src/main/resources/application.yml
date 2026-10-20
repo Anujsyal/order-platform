@@ -1,0 +1,32 @@
+spring:
+  application:
+    name: order-service
+
+server:
+  port: 8080
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+      # Exact 300ms bucket so the latency SLO (99% < 300ms) can be computed precisely
+      slo:
+        http.server.requests: 300ms
+
+app:
+  version: ${APP_VERSION:local}
+  environment: ${APP_ENV:local}
+  fault:
+    error-rate: ${FAULT_ERROR_RATE:0.0}
