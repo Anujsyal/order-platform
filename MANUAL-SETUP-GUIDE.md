@@ -42,7 +42,7 @@ Plan simple hai:
 4. [C. Pura flow: commit se prod tak](#c-pura-flow-commit-se-prod-tak)
 5. [D. Approval gates](#d-approval-gates)
 6. [E. Policy-as-code](#e-policy-as-code-3-layers)
-7. [F. Automated rollback demo](#f-automated-rollback-demo)
+7. [F. Automated rollback demo](#f-automated-rollback-demo) + [F2. Drift + self-healing drill](#f2-drift--self-healing-drill)
 8. [G. Monitoring + smart alerting](#g-monitoring--smart-alerting)
    - [G1. URLs + login](#g1-urls-aur-login) · [G2. Slack setup](#g2-slack-setup-alertmanager--jenkins) · [G3. CloudWatch email](#g3-cloudwatch-email-alerts-sns) · [G4. Alert ka safar](#g4-alert-ka-safar-metric-se-slack-tak)
    - [G5. SLO + burn rate](#g5-slo-aur-burn-rate-alerting-ye-smart-part-hai) · [G6. Noise control](#g6-alertmanager-ke-noise-control-features) · [G7. Alerts list](#g7-saare-alerts-ki-list) · [G8. Dashboards](#g8-grafana-dashboards)
@@ -1136,6 +1136,85 @@ kubectl run test --image=nginx:latest -n order-service
 kubectl get policyreport -n order-service
 ```
 
+### Dev cluster pe poora policy drill (Batch 11 mein asal mein kiya)
+
+**Pehle concept: admission chain.** `kubectl run` → API server: authentication (kaun?) → authorization/RBAC (permission?) → mutating admission → schema validation → **validating admission** (PSA built-in + Kyverno webhook) → etcd. Validating step mein **koi bhi ek "No"** = pod reject.
+
+| Tool | Kya hai | Kahan laga |
+|---|---|---|
+| **Pod Security Admission (PSA)** | Kubernetes built-in (1.25+ stable). Levels: privileged / baseline / restricted | `order-service` namespace label `pod-security.kubernetes.io/enforce: restricted` |
+| **Kyverno** | Policy engine (validating webhook); Audit = report, Enforce = reject | 5 ClusterPolicies; sirf label `policy.order-platform.io/enforce=true` wale namespaces pe |
+| **Argo CD** | selfHeal: cluster ko Git jaisa rakhta hai | kyverno-policies app (`prune` + `selfHeal`) |
+
+```bash
+export KUBECONFIG=~/.kube/order-platform-dev
+
+# B1: app compliant hai?  → order-service ke saare reports PASS 7, FAIL 0
+kubectl get polr -A
+
+# B2: test namespace: Kyverno label haan, PSA nahi (warna PSA pehle hi rok deta, Audit dikhta nahi)
+kubectl create namespace policy-test
+kubectl label namespace policy-test policy.order-platform.io/enforce=true
+
+# B3: Kyverno AUDIT test → "pod/bad-nginx created" (block nahi), ~20s baad PASS 1 FAIL 6
+kubectl run bad-nginx -n policy-test --image=nginx:latest
+kubectl get polr -n policy-test
+kubectl get polr -n policy-test -o jsonpath='{range .items[*].results[*]}{.policy}{" -> "}{.result}{": "}{.message}{"\n"}{end}'
+kubectl get events -n policy-test --field-selector reason=PolicyViolation   # turant dikhta hai
+
+# B4: PSA test (app namespace) → Forbidden: violates PodSecurity "restricted:latest"
+kubectl run bad-nginx -n order-service --image=nginx:latest
+
+# B5a: policy ko haath se Enforce karo → Argo CD selfHeal ~1s mein wapas Audit (bad-2 ban jaata hai)
+kubectl patch clusterpolicy disallow-latest-tag --type=merge -p '{"spec":{"validationFailureAction":"Enforce"}}'; sleep 3; kubectl run bad-2 -n policy-test --image=nginx:latest; sleep 20; kubectl get clusterpolicy disallow-latest-tag -o jsonpath='{.spec.validationFailureAction}{"\n"}'
+kubectl get events -n argocd --field-selector involvedObject.name=kyverno-policies   # Synced -> OutOfSync -> automated sync -> Synced
+
+# B5b: asli Enforce dekhna: alag policy jo Git mein NAHI hai (Argo CD use nahi chhuta)
+cat <<'EOF' | kubectl apply -f -
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: demo-enforce-latest
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    - name: no-latest
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["policy-test"]
+      validate:
+        message: "DEMO Enforce: the 'latest' tag is blocked."
+        pattern:
+          spec:
+            containers:
+              - image: "!*:latest"
+EOF
+sleep 5; kubectl run bad-3 -n policy-test --image=nginx:latest
+# → admission webhook "validate.kyverno.svc-fail" denied the request ... DEMO Enforce
+
+# Cleanup
+kubectl delete clusterpolicy demo-enforce-latest
+kubectl delete namespace policy-test
+```
+
+**B3 ke 6 FAIL:** `latest` tag · `app.kubernetes.io/name` label nahi (`kubectl run` sirf `run=` lagata hai) · runAsNonRoot · allowPrivilegeEscalation · requests/limits · registry `docker.io/maverick8826` nahi. PASS: tag diya tha.
+
+**Kyun aisa dikha:**
+- **Report der se:** Kyverno pehle EphemeralReport banata hai, reports-controller ~10–30s mein PolicyReport mein jodta hai. Events turant aate hain.
+- **Har violation 2 baar (events):** admission pe + **background scan** pe (`background: true`). Background scan purane (policy se pehle bane) resources bhi pakadta hai.
+- **B4:** dev mein Kyverno Audit hai, phir bhi PSA ne roka = **defense in depth**. PSA sirf pod security dekhta hai; registry/labels/limits jaise org rules Kyverno ke.
+- **B5a:** Git = source of truth. Policy kamzor karne ka manual badlav bhi wapas. Policy badalni ho to Git → PR → merge.
+
+| Mode | Pod banega? | Kahan dikhta | Kahan use |
+|---|---|---|---|
+| Audit | ✅ | PolicyReport, Events, metric → `KyvernoPolicyViolations` | dev |
+| Enforce | ❌ | kubectl / Argo CD sync error turant | staging, prod |
+
+Pattern: nayi policy pehle Audit → reports padho → violations theek karo → Enforce.
+
 ### Locally policies test karna
 ```bash
 # Terraform
@@ -1182,6 +1261,56 @@ Do levels pe rollback hota hai:
 5. gitops repo ki history mein `rollback(dev): revert ...` commit dikhega.
 
 > Manually rollback karna ho (bina Jenkins): `kubectl argo rollouts abort order-service -n order-service`, ya gitops repo mein `git revert` karke push kar. **Hamesha Git se karna best hai**, warna Argo CD selfHeal tera manual change wapas palat dega.
+
+### Asal mein kya hua (Batch 11, build #10 `10-90d02cd`)
+
+**Plugin ke bina dekhna** (Windows Git Bash): `-w` sirf **ek** resource type leta hai (`kubectl get rollout,analysisrun -w` → "you may only specify a single resource type"):
+```bash
+kubectl get rollout -n order-service -w          # terminal 1
+kubectl get analysisrun -n order-service -w      # terminal 2
+# ya ek terminal mein (Git Bash mein `watch` nahi hota):
+while true; do clear; date; kubectl get rollout,analysisrun -n order-service; sleep 10; done
+
+# Fault sach mein laga? (pehle confirm, phir result pe bharosa)
+kubectl exec -n order-service <canary-pod> -- env | grep -E "APP_VERSION|FAULT"   # FAULT_ERROR_RATE=0.5
+```
+
+| Time (IST) | Kya hua |
+|---|---|
+| 18:23 | Build start; CI stages normal |
+| ~18:24 | `promote(dev): order-service 10-90d02cd` commit |
+| 18:25 | Argo CD ne ~3 min poll ke baad sync kiya → 25% → 1 kharab pod + 2 purane |
+| 18:26:50 / 18:27:20 / 18:27:50 | Success rate **0.881 / 0.889 / 0.857** (< 0.95) → "failed (3) > failureLimit (2)" → **RolloutAborted** |
+| 18:38 | Slack `ArgoCDAppDegraded` (for 10m) |
+| 18:40 | Slack `RolloutAborted` (rule fix ke baad, J table dekho) |
+| 18:40 | `verify-deployment.sh` 15min 10s timeout → `rollback.sh` → `rollback(dev): revert ...` → Slack #deployment ⏪ + ❌ |
+| 18:42 | Argo CD sync → Synced/Healthy |
+
+- **~88% kyun, 50% kyun nahi:** 3 mein se 1 pod kharab → ~1/3 traffic × 50% errors. Yahi canary ka fayda hai: blast radius chhota.
+- **Jenkins 15 min kyun ruka:** Jenkins ke paas cluster access nahi (design). Sirf URL dekhta hai, to abort ka pata timeout se chalta hai. Alternatives: Jenkins mein `kubectl argo rollouts status` (credentials dene padenge) ya Rollouts notifications → webhook.
+- ⚠️ **`SIMULATE_BAD_RELEASE` tick zaroor karna.** Default false hai. Build ke neeche "SIMULATED BAD RELEASE" dikhna chahiye, warna normal release banegi aur analysis pass ho jayega.
+
+## F2. Drift + self-healing drill
+
+Do levels: **Kubernetes** controllers etcd ke hisaab se theek karte hain; **Argo CD selfHeal** Git ke hisaab se.
+
+```bash
+# C1 (Kubernetes): pod delete → ReplicaSet 1s mein naya pod banata hai
+kubectl delete pod -n order-service $(kubectl get pods -n order-service -o name | grep order-service- | head -1 | cut -d/ -f2)
+
+# C2 (Argo CD): replicas haath se → DESIRED 4, 10s baad wapas 2 (Git mein replicas: 2)
+kubectl scale rollout order-service -n order-service --replicas=4; kubectl get rollout order-service -n order-service; sleep 10; kubectl get rollout order-service -n order-service
+
+# C3 (Argo CD): managed object delete → PDB wapas (AGE ~10s). Kubernetes khud deleted object nahi banata.
+kubectl delete pdb order-service -n order-service; sleep 10; kubectl get pdb -n order-service
+
+# C4: saboot
+kubectl get events -n argocd --field-selector involvedObject.name=order-service --sort-by=.lastTimestamp | tail -8
+# Synced -> OutOfSync | Initiated automated sync | Partial sync operation ... succeeded | OutOfSync -> Synced
+```
+- `kubectl scale` etcd hi badal deta hai, to Kubernetes maan leta hai. Sirf Argo CD pakadta hai. Asli autoscaling = HPA + Argo CD `ignoreDifferences` on `/spec/replicas`.
+- **Partial sync:** selfHeal sirf OutOfSync resources apply karta hai (~1s), baaki pods ko nahi chhedta.
+- `selfHeal: false` → app OutOfSync (peela) dikhega, manual Sync tak. `prune: false` → Git se hati file ka resource orphan.
 
 ---
 
@@ -1673,6 +1802,14 @@ Do tarah ka "infra" hai, aur dono dev → staging → prod jaate hain:
 | Grafana Availability / Error budget **"No data"**, baaki panels theek | 5xx series exist hi nahi (koi error nahi aaya); PromQL mein `sum(khaali)` = khaali, 0 nahi | Prometheus API pe rule query: `slo:sli_error:ratio_rate1h` → `[]`. Fix: SLI rules mein `(sum(rate(...5xx...)) or vector(0)) / sum(rate(...))` |
 | Abort dabaya, phir Slack: "failed post-deploy verification" + GitOps revert | Jenkinsfile `catch (err)` ne abort (`FlowInterruptedException`) bhi pakad liya | Console: `Sending interrupt signal to process` = abort. Fix: `catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) { throw e }` generic catch se pehle. Canary (~8–9 min) ke beech abort mat daba |
 | Gitops `git push` → `rejected (non-fast-forward)` | Jenkins ne beech mein `promote(dev)` commit kiya | `git pull --rebase && git push` (gitops repo mein do likhne wale: tu + Jenkins) |
+| `git pull --rebase` → "cannot pull with rebase: You have unstaged changes" | Badli file abhi commit nahi hui | Order: **commit → `git pull --rebase` → push** (ya `git pull --rebase --autostash`) |
+| `git pull --rebase` → "Cannot rebase onto multiple branches" | Koi doosra process (script/IDE auto-fetch) usi waqt `git fetch` kar raha tha → `.git/FETCH_HEAD` race | `git fetch origin && git rebase origin/main && git push` |
+| Canary abort hua, Slack mein `ArgoCDAppDegraded` aaya par **`RolloutAborted` kabhi nahi** | Rule `rollout_info{phase="Degraded"}` dhoondhta tha; metric aborted canary ko **`phase="Abort"`** deti hai, aur `namespace` label controller (`argo-rollouts`) ka hota hai, app ka `exported_namespace` mein | Raw metric dekh: `kubectl get --raw "/api/v1/namespaces/monitoring/services/prometheus-operated:9090/proxy/api/v1/query?query=rollout_info"`. Fix (`platform/monitoring/platform-alerts.yaml`): `max by (name, namespace) (label_replace(rollout_info{phase="Abort"}, "namespace", "$1", "exported_namespace", "(.+)")) == 1` |
+| `SIMULATE_BAD_RELEASE` build ka canary **pass** ho gaya (analysis 1.0) | Checkbox tick nahi hua → image mein `FAULT_ERROR_RATE=0.0` | `kubectl exec <pod> -- env \| grep FAULT`; Build with Parameters → tick → naam ke neeche "SIMULATED BAD RELEASE" check |
+| `kubectl get a,b -w` → "you may only specify a single resource type" | Watch ek hi type leta hai | Do terminals, ya `while true; do clear; kubectl get a,b; sleep 10; done` |
+| `kubectl` → `localhost:8080 ... actively refused` | Is terminal mein `KUBECONFIG` set nahi (kubeconfig nahi mila → purana default localhost:8080). Cluster down **nahi** | `export KUBECONFIG=~/.kube/order-platform-dev`; permanent: `~/.bashrc` mein daal |
+| `kubectl get polr -n <ns>` → "No resources found" (pod abhi bana) | PolicyReport ~10–30s baad banta hai (EphemeralReport → reports-controller) | Thoda ruk; turant ke liye `kubectl get events -n <ns> --field-selector reason=PolicyViolation` |
+| Cluster mein `kubectl patch/scale/delete` kiya, kuch second mein wapas purana | Argo CD **selfHeal** (expected) | Badlav Git mein karo. Events: `kubectl get events -n argocd --field-selector involvedObject.name=<app>` |
 
 **Debug commands jo hamesha kaam aate hain:**
 ```bash
