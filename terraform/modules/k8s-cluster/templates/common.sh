@@ -1,6 +1,6 @@
 # ---- Common node setup: kernel prereqs, containerd, kubeadm/kubelet/kubectl ----
 # Inserted verbatim into master/worker user-data (not template-rendered).
-# Expects K8S_MINOR to be set (e.g. v1.31). Manual equivalent: guide section A13.
+# Expects K8S_MINOR to be set (e.g. v1.36). Manual equivalent: guide section A13.
 export DEBIAN_FRONTEND=noninteractive
 
 # kubelet refuses to run with swap on

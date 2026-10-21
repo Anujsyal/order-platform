@@ -29,6 +29,10 @@ def promoteAndVerify(String envName, String appUrl, int timeoutSeconds) {
     }
     try {
         sh "bash scripts/verify-deployment.sh '${appUrl}' '${env.IMAGE_TAG}' ${timeoutSeconds}"
+    } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException aborted) {
+        // A person (or a timeout) aborted the build mid-verification. That says nothing
+        // about the release, so don't revert it or report it as a failed verification.
+        throw aborted
     } catch (err) {
         // Argo Rollouts has most likely already aborted the canary in-cluster.
         // Revert the Git commit too, so desired state == what is actually running.

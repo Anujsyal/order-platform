@@ -52,7 +52,7 @@ variable "worker_count" {
 
 variable "kubernetes_minor_version" {
   type    = string
-  default = "v1.31"
+  default = "v1.36"
 }
 
 variable "gitops_repo_url" {

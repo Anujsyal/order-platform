@@ -45,7 +45,7 @@ variable "worker_count" {
 variable "kubernetes_minor_version" {
   description = "pkgs.k8s.io channel. The kubeadm config uses v1beta4, so keep this at v1.31 or newer."
   type        = string
-  default     = "v1.31"
+  default     = "v1.36"
 }
 
 variable "pod_cidr" {
@@ -56,12 +56,12 @@ variable "pod_cidr" {
 
 variable "calico_version" {
   type    = string
-  default = "v3.28.2"
+  default = "v3.33.0"
 }
 
 variable "argocd_version" {
   type    = string
-  default = "v2.12.6"
+  default = "v3.5.6"
 }
 
 variable "gitops_repo_url" {

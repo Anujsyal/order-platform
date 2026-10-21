@@ -291,10 +291,17 @@ free -h      # Swap: 2.0Gi dikhna chahiye
 
 ## A5. Java install
 
-Jenkins khud Java pe chalta hai, aur hamara app bhi Java 21 hai:
+Jenkins aur hamara app Java 25 LTS use karte hain. Ubuntu 24.04 ke default repo mein Java 25 nahi hai, isliye Eclipse Temurin ka official repo add kar:
 ```bash
-sudo apt-get install -y openjdk-21-jdk fontconfig
-java -version        # openjdk version "21..."
+sudo apt-get install -y ca-certificates curl gnupg fontconfig
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://packages.adoptium.net/artifactory/api/gpg/key/public \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/adoptium.gpg
+echo "deb [signed-by=/etc/apt/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb $(. /etc/os-release && echo "$VERSION_CODENAME") main" \
+  | sudo tee /etc/apt/sources.list.d/adoptium.list
+sudo apt-get update
+sudo apt-get install -y temurin-25-jdk
+java -version        # openjdk version "25..."
 ```
 
 ## A6. Jenkins install
@@ -419,7 +426,7 @@ Har tool ke aage **OK** aana chahiye. **MISSING** aaye to us tool ka install ste
 
 | Tool | Kya hai | Is project mein kahan use hota hai | Real-world use case |
 |---|---|---|---|
-| **Java 21 (OpenJDK)** | Java runtime + compiler | (1) **Jenkins khud Java pe chalta hai**, bina Java ke Jenkins start hi nahi hota. (2) Maven isi JDK se app compile karta hai | Har Java/Spring app ka build aur run; Jenkins, Kafka, Elasticsearch jaise tools bhi Java pe chalte hain |
+| **Java 25 LTS (Eclipse Temurin)** | Java runtime + compiler | Jenkins khud Java pe chalta hai, aur Maven isi JDK se app compile karta hai | Har Java/Spring app ka build aur run; Jenkins, Kafka, Elasticsearch jaise tools bhi Java pe chalte hain |
 | **Jenkins** | CI/CD automation server | Dono pipelines chalata hai: `Jenkinsfile` (build → scan → push → promote) aur `Jenkinsfile.infra` (Terraform) | Har commit pe automatic build/test/deploy, approval gates, scheduled jobs |
 | **Maven** (`mvn`) | Java build tool + dependency manager | Stage *Build & Unit Test*: `mvn -B -ntp clean verify`. Dependencies download, compile, JUnit tests, `order-service.jar` banana | Java projects ka standard build: dependencies (`pom.xml`), tests, packaging (jar/war) |
 | **Git** | Version control | Jenkins code repo clone karta hai; `promote.sh`/`rollback.sh` GitOps repo clone, commit, push karte hain | Code history, branching, PRs; GitOps mein deploy = git commit |
@@ -501,6 +508,18 @@ Pipeline ko har env ka app URL chahiye, taaki deploy ke baad verify kar sake. Ma
 
 Value = us cluster ke **kisi worker ka PRIVATE IP** + port `30080` (app ka NodePort). Terraform setup mein `terraform output app_url_for_jenkins` yahi deta hai.
 
+**🧠 Ye variable karta kya hai? (interview ke liye)**
+| Sawal | Jawab |
+|---|---|
+| Kaun use karta hai? | Jenkinsfile: `promoteAndVerify('dev', env.DEV_APP_URL, 900)`. Khaali ho to turant `DEV_APP_URL is not set in Jenkins global properties` error (mere build #5 mein yahi hua tha). |
+| Kya karta hai? | Git commit (`promote.sh`) ke baad `scripts/verify-deployment.sh <URL> <IMAGE_TAG> 900` chalta hai. Har few second `<URL>/api/version` (version == naya tag?) aur `<URL>/api/orders` (HTTP 200?) check karta hai. |
+| Pass kab? | **10 lagatar** sahi responses. Ek bhi galat hua to streak 0 se shuru, isliye aadha rolled-out ya aborted canary "success" nahi ginta. 900s mein na ho → FAILED → `rollback.sh` GitOps commit revert. |
+| Jenkinsfile mein hardcode kyun nahi? | URL environment ka **data** hai, code nahi. Cluster dobara bana aur IP badla, to sirf Jenkins setting badlo, code commit nahi. Same Jenkinsfile har env ke liye. |
+| 3 variables kyun? | Har env ka apna cluster aur URL. Pehle sirf `DEV_APP_URL` chahiye; `STAGING_APP_URL` / `PROD_APP_URL` tab, jab wo clusters banenge. |
+| Credentials mein kyun nahi? | Ye secret nahi hai (sirf URL). Global properties ki env vars har build ko `env.X` ki tarah milti hain. |
+
+Mera dev: `DEV_APP_URL = http://172.31.0.118:30080` (worker-1 private IP + order-service NodePort 30080).
+
 > Private IP kyun? Jenkins aur clusters same VPC mein hain, aur cluster SG Jenkins SG se NodePorts allow karta hai. Public internet pe expose karne ki zarurat nahi.
 >
 > (Manual setup mein agar Jenkins default VPC mein hai aur cluster bhi, to bhi private IP chalega, bas cluster SG mein `jenkins-sg` se 30000-32767 allow karna (A13.1).)
@@ -559,12 +578,48 @@ Hum 1 master (control plane) + 2 workers banayenge. EKS nahi, **apna khud ka clu
 | Custom TCP | 30000-32767 | My IP | NodePorts: app, Argo CD UI, Grafana |
 | Custom TCP | 30000-32767 | **jenkins-sg** | Jenkins post-deploy verification |
 
-> "Self" rule kaise: pehle SG bina us rule ke bana, phir Edit inbound → Source mein `k8s-sg` ka hi ID select kar.
+> "Self" rule kaise: pehle SG bina us rule ke bana (SG bana hi nahi to khud ko select kaise karega), phir Edit inbound → Add rule → All traffic → Source **Custom** → `k8s-sg` ka hi `sg-...` ID select kar.
+
+**🧠 Kyun (interview ke liye):**
+- **Self rule kyun?** Ye rule kehta hai ki is SG wali machines aapas mein kuch bhi baat kar sakti hain. Nodes ko bahut saare ports chahiye: kubelet 10250, API 6443, Calico BGP 179. **Calico IPIP to TCP/UDP hai hi nahi, wo IP protocol 4 hai.** Har port alag kholna mushkil hai aur galti ka chance zyada hai. "All traffic sirf apne SG se" safe bhi hai, kyunki bahar ki duniya ke liye sab band hi rehta hai.
+- **Source mein IP ki jagah SG kyun?** Node ka IP stop/start pe badal sakta hai, aur naya node bhi add ho sakta hai. SG reference ka matlab hai "jis bhi machine pe ye SG laga hai", to rule kabhi purana nahi hota.
+- **`jenkins-sg` → 30000-32767:** Jenkins deploy ke baad `verify-deployment.sh` se app ka `/actuator/health` aur version check karta hai, NodePort pe. Jenkins kabhi cluster API (6443) ko touch nahi karta. Uska kaam sirf image push karna aur GitOps commit karna hai.
+- **6443 aur 22 sirf My IP se:** API server aur SSH internet pe khule hon to bots minutes mein brute-force shuru kar dete hain.
+- **Outbound "All traffic" zaroori hai:** SG stateful hai, lekin naya bahar jaane wala connection (apt, image pull, pkgs.k8s.io) outbound rule ke bina nahi jaata (Problem #5).
+
+**Check (laptop Git Bash, read-only):**
+```bash
+aws ec2 describe-security-group-rules --region ap-south-1   --filters Name=group-id,Values=<k8s-sg-id>   --query "SecurityGroupRules[].[IsEgress,IpProtocol,FromPort,ToPort,CidrIpv4,ReferencedGroupInfo.GroupId]" --output table
+# 5 inbound (IsEgress=False) + 1 outbound (True, -1, 0.0.0.0/0)
+```
 
 ### A13.2 3 EC2 launch kar
 A3 jaisa hi, bas: Name `k8s-master` (1) aur `k8s-worker` (Number of instances: 2), **c7i-flex.large** (paid account: t3.medium), SG `k8s-sg`, 30 GB encrypted, IMDSv2.
 
+| Field | Value |
+|---|---|
+| Name | `k8s-master` (Number of instances 1), phir doosra launch `k8s-worker` (Number of instances **2**) → baad mein ✏️ se `k8s-worker-1` / `k8s-worker-2` |
+| AMI | Ubuntu Server 24.04 LTS, **64-bit (x86)** (ARM nahi) |
+| Instance type | **c7i-flex.large** (Free plan pe t3 block, Problem #1) |
+| Key pair | `order-platform-key` |
+| Network → Edit | Auto-assign public IP: Enable · **Select existing SG → `k8s-sg`** (launch-wizard nahi) |
+| Storage | 30 GiB · gp3 · Advanced → **Encrypted: Yes** |
+| Advanced details | Metadata version **V2 only (token required)** · hop limit **1** |
+
 > **c7i-flex.large / t3.medium kyun?** kubeadm ko master pe minimum 2 CPU + 2 GB chahiye. micro instances pe `kubeadm init` preflight mein hi fail ho jaata hai.
+
+> **vCPU hisaab (Free plan quota 8):** Jenkins 2 + master 2 + 2 workers × 2 = **8**. 9th vCPU wali machine `VcpuLimitExceeded` degi. Terminate ki hui machine "terminated" hone tak (1–2 min) quota gherti hai.
+
+> ⚠️ **Encryption bhool gaye?** (Mere saath hua: pehla master `Encrypted: False` bana.) EBS encryption launch ke baad ON nahi hoti (snapshot → encrypted copy → naya volume, jhanjhat). Khaali machine hai to **terminate karke dobara launch** karna sabse aasaan hai. Aage ke liye: **EC2 → Account attributes → Data protection and security → EBS encryption → Manage → ☑ Always encrypt new EBS volumes**. Isse region ke saare naye disks apne aap encrypted banenge.
+>
+> **Kyun zaroori?** Disk/snapshot leak ho jaye to bhi data KMS key ke bina padha nahi ja sakta. Ye compliance (CIS benchmark) ka basic check hai, aur performance pe koi asar nahi.
+
+**Check (read-only):**
+```bash
+aws ec2 describe-instances --region ap-south-1   --query "Reservations[].Instances[].[Tags[?Key=='Name']|[0].Value,InstanceType,State.Name,PublicIpAddress,PrivateIpAddress,SecurityGroups[0].GroupName,MetadataOptions.HttpTokens]" --output table
+aws ec2 describe-volumes --region ap-south-1 --query "Volumes[].[Attachments[0].InstanceId,Size,VolumeType,Encrypted]" --output table
+# sab nodes: c7i-flex.large, k8s-sg, required · sab volumes: 30 gp3 True
+```
 
 ### A13.3 SAARE 3 nodes pe (master + workers)
 
@@ -602,17 +657,41 @@ containerd config default | sudo tee /etc/containerd/config.toml > /dev/null
 # Mismatch hua to pods random restart hote hain.
 sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
 sudo systemctl restart containerd && sudo systemctl enable containerd
+containerd --version                                  # 2.x hona chahiye (k8s 1.36+ containerd 1.x support nahi karta)
+grep -n 'SystemdCgroup' /etc/containerd/config.toml   # "SystemdCgroup = true" dikhna chahiye
 
 # --- 5. kubeadm, kubelet, kubectl ---
 sudo mkdir -p /etc/apt/keyrings
-curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key \
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key \
   | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /' \
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /' \
   | sudo tee /etc/apt/sources.list.d/kubernetes.list
 sudo apt-get update
 sudo apt-get install -y kubelet kubeadm kubectl
 sudo apt-mark hold kubelet kubeadm kubectl   # galti se upgrade na ho
 sudo systemctl enable kubelet
+```
+
+**🧠 Har step kyun (interview ke liye):**
+
+| Step | Kyun |
+|---|---|
+| **Swap off** | kubelet memory ka hisaab RAM ke hisaab se karta hai. Swap ho to pod ki memory limits ka matlab bigad jaata hai, isliye kubelet by default swap pe start hi nahi hota. |
+| **overlay** | Container images ki layers ek ke upar ek jodne wala filesystem. |
+| **br_netfilter + bridge-nf-call-iptables** | Pod ka traffic Linux bridge se jaata hai. Ye setting usko iptables se guzaarti hai, taaki **Service (ClusterIP)** ke rules lagein. |
+| **ip_forward = 1** | Node ko router banne deta hai, taaki doosre node ke pod ka packet aage bhej sake. |
+| **containerd 2.x** | Kubernetes 1.36 se containerd 1.x support khatam ho gaya hai. Ubuntu 24.04 ke updates mein containerd 2.2 aata hai, isliye ye sahi baith jaata hai. |
+| **SystemdCgroup = true** | kubelet aur containerd dono ek hi cgroup manager (systemd) use karein. Mismatch ho to pods random restart hote hain. |
+| **apt-mark hold** | `apt upgrade` galti se Kubernetes ka version na badal de. Cluster upgrade hamesha soch-samajh ke, `kubeadm upgrade` se hota hai. |
+
+**Check (har node pe):**
+```bash
+free -h | grep -i swap                                          # Swap: 0B
+sysctl net.ipv4.ip_forward net.bridge.bridge-nf-call-iptables   # dono = 1
+containerd --version; systemctl is-active containerd            # 2.x, active
+grep -n 'SystemdCgroup' /etc/containerd/config.toml             # = true
+kubeadm version -o short                                        # v1.36.x
+apt-mark showhold                                               # kubeadm kubectl kubelet
 ```
 
 > **Docker kyun nahi?** Kubernetes 1.24 se dockershim hat gaya. Ab kubelet seedha **containerd** se CRI ke through baat karta hai. Docker sirf Jenkins pe image *build* karne ke liye hai.
@@ -630,6 +709,25 @@ sudo kubeadm init \
 - `--pod-network-cidr=192.168.0.0/16`: Calico ka default pod range.
 - `--apiserver-cert-extra-sans`: API server certificate mein public IP bhi daalta hai, taaki laptop se kubectl kaam kare.
 
+> ⚠️ **Sirf `kubeadm init` likha (bina `sudo`, bina flags)?** Output: `[ERROR IsPrivilegedUser]: user is not running as root` aur `remote version is much newer: v1.37.1; falling back to: stable-1.36`. Preflight pehle hi ruk gaya, kuch bana nahi, to koi cleanup nahi chahiye. Upar wala **poora** command `sudo` ke saath chala. Bina flags ke pod CIDR set nahi hota (Calico ka IP pool galat banta) aur certificate mein public IP nahi jaata (laptop kubectl x509 error deta).
+> - **`falling back to stable-1.36` ka matlab:** kubeadm internet pe latest stable (1.37.1) dekhta hai. Wo installed kubeadm (1.36) se zyada naya hai, isliye apne minor version (1.36.x ka latest patch) pe hi rehta hai. kubeadm apne se naya control plane install nahi karta.
+
+- `--apiserver-advertise-address=$PRIVATE_IP`: API server ko VPC ke andar wale IP pe announce karta hai. Workers isi pe join karte hain. Private IP stop/start pe nahi badalta, public IP badal jaata hai.
+
+**🧠 `kubeadm init` andar kya karta hai (interview ke liye):**
+| Phase | Kya hota hai |
+|---|---|
+| preflight | CPU ≥ 2, RAM, swap off, ports free, containerd chal raha hai, sab check karta hai |
+| certs | `/etc/kubernetes/pki` mein cluster ka **CA** aur apiserver/etcd/kubelet ke certificates banata hai |
+| kubeconfig | `admin.conf`, `kubelet.conf`, `controller-manager.conf`, `scheduler.conf` banata hai |
+| control-plane | `/etc/kubernetes/manifests/` mein **static pod** YAML likhta hai (apiserver, controller-manager, scheduler, etcd). kubelet in files ko dekh ke khud pods chala deta hai, API server ke bina bhi. |
+| bootstrap-token | Workers ke join ke liye ek token (24h valid) |
+| addons | **CoreDNS** (cluster DNS) aur **kube-proxy** (Service → pod routing) install karta hai |
+
+- **CoreDNS `Pending` kyun dikhta hai?** CNI (Calico) lagne tak pod network hai hi nahi, isliye node `NotReady` rehta hai aur CoreDNS schedule nahi hota. Ye normal hai.
+- **`admin.conf` = cluster-admin ki chaabi.** Isme client certificate hai jiske paas poore cluster ka full access hai. Ise kabhi GitHub/chat mein mat daalna.
+- **Join command (token + hash) chat ya screenshot mein share mat kar.** Token 24h valid hai. Port 6443 sirf tere IP se khula hai, phir bhi secret ko secret hi rakh.
+
 Output ke end mein ek **`kubeadm join ...`** command aayegi. **Copy karke rakh.**
 
 kubectl setup (ubuntu user ke liye):
@@ -642,10 +740,21 @@ kubectl get nodes      # master "NotReady" dikhega, kyunki network plugin abhi n
 
 **Calico (pod network) install:**
 ```bash
-kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
+kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.33.0/manifests/calico.yaml
 kubectl get pods -n kube-system -w      # calico-node Running → Ctrl+C
 kubectl get nodes                       # ab "Ready"
 ```
+**Output kaise padhe (`kubectl get pods -n kube-system`):**
+| Pod | Kya hai | Kitne |
+|---|---|---|
+| `etcd-*`, `kube-apiserver-*`, `kube-controller-manager-*`, `kube-scheduler-*` | Control plane **static pods**. Naam mein node ka naam hota hai, kyunki ye usi node ki manifest files se bane hain. | 1 each (sirf master) |
+| `kube-proxy-*` | **DaemonSet**: har node pe ek (Service → pod iptables rules) | nodes jitne |
+| `calico-node-*` | **DaemonSet**: har node pe ek (pod IPs, routes, NetworkPolicy) | nodes jitne |
+| `calico-kube-controllers-*` | Deployment: Calico ka cluster-level controller | 1 |
+| `coredns-*` | Deployment: cluster DNS (`svc-name.namespace.svc.cluster.local`) | 2 (HA) |
+
+`kubectl get nodes -o wide` mein dekh: `STATUS Ready`, `VERSION v1.36.x`, `INTERNAL-IP` = private IP, `CONTAINER-RUNTIME containerd://2.x`. `EXTERNAL-IP <none>` normal hai, kyunki kubeadm ko AWS ka public IP pata nahi hota (cloud-controller-manager nahi hai).
+
 > Calico kyun (Flannel nahi)? Flannel **NetworkPolicy support nahi karta**. Hamare project mein default-deny network policies hain, wo Calico hi enforce karega.
 
 ### A13.5 Har WORKER pe
@@ -657,6 +766,21 @@ sudo kubeadm join 172.31.x.x:6443 --token abcdef.0123456789abcdef \
 - **token**: worker ko cluster join karne ki permission (24h valid).
 - **ca-cert-hash**: worker verify karta hai ki wo *asli* master se baat kar raha hai (MITM protection).
 
+> ⚠️ **`<token>` / `<hash>` waise hi paste kar diya?** Output: `-bash: syntax error near unexpected token 'newline'`. Bash mein `<` / `>` **redirection** hain, isliye command chali hi nahi (koi nuksaan nahi). Asli values chahiye. Join command kho gayi ho to master pe `sudo kubeadm token create --print-join-command` chala. Ye poori ready line deta hai. Worker pe `sudo ` likh ke paste kar.
+
+**Join ke baad token delete kar (achhi aadat):** sab workers join ho gaye to token ka koi kaam nahi. Agar wo galti se screenshot/chat mein dikh gaya ho (mere saath hua), to aur bhi zaroori hai:
+```bash
+kubeadm token list                          # master pe (kubectl wala user)
+sudo kubeadm token delete <token-id>        # token-id = token ka pehla hissa (dot se pehle, 6 characters)
+```
+
+**Output kaise padhe (`kubeadm init`):**
+- `Creating static Pod manifest`: etcd/apiserver/controller-manager/scheduler ki YAML `/etc/kubernetes/manifests` mein likhi gayi.
+- `kube-apiserver is healthy`: API server zinda hai.
+- `taints [node-role.kubernetes.io/control-plane:NoSchedule]`: master pe app ke pods schedule nahi honge, sirf workers pe. Isse control plane ko resources ki kami nahi hoti.
+- `[bootstrap-token] ... csrapprover`: worker token se apna client certificate maangta hai (CSR), aur wo auto-approve hota hai.
+- `[addons] CoreDNS, kube-proxy`: cluster DNS + Service routing.
+
 Token expire ho gaya? Master pe naya bana:
 ```bash
 kubeadm token create --print-join-command
@@ -666,9 +790,9 @@ Master pe check:
 ```bash
 kubectl get nodes -o wide
 # NAME              STATUS   ROLES           VERSION
-# ip-172-31-1-10    Ready    control-plane   v1.31.x
-# ip-172-31-1-11    Ready    <none>          v1.31.x
-# ip-172-31-1-12    Ready    <none>          v1.31.x
+# ip-172-31-1-10    Ready    control-plane   v1.36.x
+# ip-172-31-1-11    Ready    <none>          v1.36.x
+# ip-172-31-1-12    Ready    <none>          v1.36.x
 ```
 
 ### A13.6 Laptop se kubectl
@@ -688,10 +812,14 @@ kubectl get nodes
 ```bash
 kubectl create namespace argocd
 kubectl apply -n argocd --server-side --force-conflicts \
-  -f https://raw.githubusercontent.com/argoproj/argo-cd/v2.12.6/manifests/install.yaml
+  -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.5.6/manifests/install.yaml
 kubectl get pods -n argocd -w        # sab Running → Ctrl+C
 ```
 > `--server-side` kyun? Argo CD ke CRDs bahut bade hain. Normal `kubectl apply` "annotation too long" error de deta hai.
+>
+> `--force-conflicts` kyun? Server-side apply har field ka "owner" (field manager) yaad rakhta hai. Re-install/upgrade pe agar koi field kisi aur manager ne set ki thi to conflict aata hai. Ye flag bolta hai "is file ki value jeete".
+
+> **Versions (Oct 2026, k8s v1.36 ke liye):** Argo CD **v3.5.6** (official docs: 3.5 tested on k8s 1.33–1.36; purana v2.12 1.36 pe tested nahi tha). GitOps add-ons bhi update kiye: kube-prometheus-stack **92.11.0** (65.1.1 tha), argo-rollouts chart **2.43.8** (app v1.10.1), kyverno chart **3.9.2** (Kyverno v1.19.2). Upgrade se pehle `helm template --kube-version 1.36.5` se purana vs naya render karke check kiya ki hamari values (NodePorts 30090/30300, grafana-admin secret, alertmanager-slack secret, ServiceMonitors) dono mein lag rahi hain. Kyverno 1.19 mein `spec.validationFailureAction` **deprecated** hai (rule-level `failureAction` naya tareeka), lekin abhi bhi chalta hai.
 
 **UI expose (NodePort 30443):**
 ```bash
@@ -699,6 +827,18 @@ kubectl -n argocd patch svc argocd-server \
   -p '{"spec":{"type":"NodePort","ports":[{"name":"https","port":443,"targetPort":8080,"nodePort":30443,"protocol":"TCP"}]}}'
 ```
 Browser: `https://<WORKER_PUBLIC_IP>:30443`. Self-signed cert warning aayegi → Advanced → Proceed.
+
+**🧠 Kyun (interview ke liye):**
+| Cheez | Kyun |
+|---|---|
+| Argo CD | GitOps controller: cluster ke andar se Git repo dekhta hai aur cluster ko Git jaisa banata hai. Jenkins cluster ko kabhi touch nahi karta, sirf Git mein tag likhta hai (**pull model**). Cluster credentials CI mein nahi rehte. |
+| 7 pods | application-controller (Git vs cluster compare + sync), repo-server (git clone + helm/kustomize render), server (UI/API), redis (cache), dex (SSO), applicationset-controller, notifications-controller |
+| NodePort 30443 | Har node ke 30443 pe service khulti hai; k8s-sg mein 30000-32767 sirf My IP se khula hai |
+| Self-signed cert warning | Connection encrypted hai, bas kisi public CA ne sign nahi kiya. Production: Ingress + cert-manager/Let's Encrypt |
+| `base64 -d` | Secret values base64 **encoding** hain, encryption nahi. Asli suraksha = Secret padhne ka RBAC (+ etcd encryption at rest) |
+| Initial secret delete | Password badalne ke baad purana password ek faltu secret ban jaata hai. Argo CD docs bhi delete karne ko kehte hain |
+
+**Check:** `kubectl get pods -n argocd` → 7 pods Running (application-controller-0 StatefulSet hai, baaki Deployments). `kubectl -n argocd get svc argocd-server` → `443:30443/TCP`.
 
 **Password:**
 ```bash
@@ -723,6 +863,12 @@ kubectl -n monitoring create secret generic alertmanager-slack \
 # gitops repo already GitHub pe push hona chahiye (B4)
 kubectl apply -f gitops/bootstrap/root-dev.yaml
 ```
+**🧠 Kyun (interview ke liye):**
+- **App-of-apps:** haath se sirf 1 Application (`root`) bani. Wo `clusters/dev/` padhti hai jisme baaki Applications ki YAML hai. Naya addon = Git mein file. Pura cluster Git se rebuild ho sakta hai (disaster recovery).
+- **Sync waves:** `-4` kube-prometheus-stack (ServiceMonitor/PrometheusRule CRDs), `-3` argo-rollouts (Rollout CRD) + kyverno, `-1` kyverno-policies + monitoring-config, `0` order-service. CRD pehle na ho to uske objects apply hi nahi hote.
+- **Secrets Git mein nahi:** Git history se ek baar commit hua secret kabhi nahi mitta. Production: External Secrets / Sealed Secrets / Vault. `openssl rand -base64 18` = 24-char random password jo kahin likha hi nahi; zaroorat pe Secret se padho: `kubectl -n monitoring get secret grafana-admin -o jsonpath="{.data.admin-password}" | base64 -d; echo`
+- **`automated: prune + selfHeal`:** selfHeal = koi `kubectl edit` kare to Argo CD wapas Git jaisa kar deta hai (drift correction); prune = Git se file hatao to cluster se resource bhi hatega.
+
 Argo CD UI mein dekh: `root` → phir `kube-prometheus-stack`, `argo-rollouts`, `kyverno`, `kyverno-policies`, `monitoring-config`, `order-service` apne aap bante jayenge. 5–10 minute lagenge. `order-service` tab tak **ImagePullBackOff/Degraded** dikhega jab tak Jenkins pehla image push na kare. Ye normal hai (tag `0.0.0` exist nahi karta).
 
 **Manual part complete! 🎉** Ab tujhe pata hai andar kya hota hai. Ab sab delete kar (EC2 terminate, SGs delete) aur Part B se code ke through bana.
@@ -1295,7 +1441,7 @@ yq 'select(.metadata.name=="kube-prometheus-stack") | .spec.source.helm.valuesOb
    gitops/clusters/dev/addons.yaml > kps-values.yaml
 
 helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
-  --version 65.1.1 -n monitoring -f kps-values.yaml
+  --version 92.11.0 -n monitoring -f kps-values.yaml
 kubectl get pods -n monitoring -w
 ```
 Phir app ke rules/dashboard: `kubectl apply -k gitops/apps/order-service/overlays/dev` (ye pura app deploy karta hai, ServiceMonitor + PrometheusRule + dashboard ke saath).
@@ -1446,12 +1592,15 @@ Do tarah ka "infra" hai, aur dono dev → staging → prod jaate hain:
 | Jenkins apt: `NO_PUBKEY` / `Unable to locate package jenkins` | Jenkins ne signing key rotate ki (2023 → **2026**), ya outbound rule missing (neeche) | A6 wali `jenkins.io-2026.key`; https://pkg.jenkins.io/debian-stable/ pe latest dekh |
 | Launch wizard mein **t3.medium select hi nahi hota** | Account **Free plan** pe hai, sirf free-tier-eligible types | Section 1.7: **c7i-flex.large** / m7i-flex.large |
 | `apt-get update`: `connection timed out` / `Network is unreachable` har mirror pe, **par SSH chal raha hai** | SG mein **outbound rule nahi** (stateful SG: SSH ka reply jaata hai, naya bahar connection nahi) | SG → Outbound rules → All traffic → 0.0.0.0/0 (A2). Pehle route table (0.0.0.0/0 → igw) aur NACL check karke rule out kar |
-| `jenkins.service` failed, `Start request repeated too quickly` | Java install nahi (Jenkins Java pe chalta hai), ya port 8080 busy | `java -version`; `sudo journalctl -u jenkins -n 30`; Java 21 install → `sudo systemctl reset-failed jenkins && sudo systemctl restart jenkins` |
+| `jenkins.service` failed, `Start request repeated too quickly` | Java install nahi (Jenkins Java pe chalta hai), ya port 8080 busy | `java -version`; `sudo journalctl -u jenkins -n 30`; Java 25 install → `sudo systemctl reset-failed jenkins && sudo systemctl restart jenkins` |
 | Jenkins login: `Invalid username or password` | Username galat (case-sensitive) / password bhool gaye | `sudo ls /var/lib/jenkins/users/` (folder ka pehla hissa = username). Reset: `/var/lib/jenkins/init.groovy.d/` mein reset script → restart → **script delete** |
 | `Sudo is disabled on this machine` | EC2 wali command **laptop (Git Bash)** pe chala di | Prompt dekh: `syala@...MINGW64` = laptop, `ubuntu@ip-...` = EC2. Pehle SSH kar |
 | Token/password screenshot ya chat mein share ho gaya | — | Leaked maan: turant revoke/delete, naya **least-privilege** token bana, sirf Jenkins credentials mein rakh |
 | `mvn` build killed / exit 137 | RAM khatam | Swap (A4), ya m7i-flex.large (8 GB) |
-| Trivy stage fail | Base image mein fixable CRITICAL CVE | Base image update kar (`eclipse-temurin:21-jre-noble` latest pull), ya report padh ke dependency upgrade |
+| Trivy stage fail | Fixable CRITICAL CVE: base image (OS) mein ya `app.jar` ki Java libraries mein | Report mein **Target** dekh: `ubuntu` row = base image update; `app.jar` row = **Library / Installed / Fixed Version** padh ke `app/pom.xml` mein Spring Boot upgrade ya `<tomcat.version>` jaisi property se pin. Patch se fix na ho (Fixed Version sirf naye major mein) to major upgrade |
+| Push Image ke baad agla build **Docker Build** pe `401 Unauthorized: incorrect username or password` (public base image pull pe!) | Purane build ka `docker login` jenkins user ke `~/.docker/config.json` mein pada reh gaya, aur wo token revoke ho chuka hai | EC2 pe `sudo -u jenkins docker logout`. Jenkinsfile ka Push stage ab temporary `DOCKER_CONFIG` + `trap` use karta hai, isliye dobara nahi hoga |
+| Jenkins checkout: `couldn't find any revision to build` | Job mein branch `*/master` reh gaya | Job → Configure → Branch Specifier `*/main` |
+| Grafana "Orders/min" panel khaali, `orders_created_total` nahi milta | Prometheus `_created` suffix reserve rakhta hai, counter `orders_total` ban jaata tha | Counter ab `orders.placed` → `orders_placed_total`. Metric naam hamesha `/actuator/prometheus` se verify kar |
 | `promote.sh`: `kustomize: command not found` | Tool missing | A8 |
 | `promote.sh`: git push 403 | PAT ki permission kam / expire | PAT: Contents Read & Write on gitops repo |
 | Verify stage: `xxx_APP_URL is not set` | A11 nahi kiya | Global env vars add kar |
@@ -1483,6 +1632,11 @@ Do tarah ka "infra" hai, aur dono dev → staging → prod jaate hain:
 | CloudWatch email nahi aata | SNS subscription confirm nahi kiya | G3; spam folder; `aws sns list-subscriptions` |
 | CloudWatch memory/disk alarm "Insufficient data" | CloudWatch agent nahi chal raha / IAM role nahi | Node pe `sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status`; log: `/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log`; instance pe IAM role attached? |
 | Prometheus restart ke baad error budget "reset" | Data `emptyDir` mein tha | Expected (G12 note); production mein persistent volume |
+| Argo CD mein `kyverno` hamesha **OutOfSync**, "Last Sync" har kuch second | Kyverno 3.9.x ke `policies.kyverno.io` CRDs mein khaali `labels: {}` / `annotations: {}`; API server empty map save nahi karta → permanent diff → auto-sync loop | Pehle dekh kaun se resources: `kubectl -n argocd get app kyverno -o jsonpath='{range .status.resources[?(@.status=="OutOfSync")]}{.kind} {.name}{"
+"}{end}'`. Fix: kyverno Application mein `ignoreDifferences` (CRD, jsonPointers `/metadata/labels`, `/metadata/annotations`) Git se push |
+| Jenkins `ERR_CONNECTION_REFUSED`, SSH chal raha | `jenkins.service` **start-limit-hit**: boot ke ~20 min baad unattended-upgrades + needrestart ne Jenkins 5+ baar restart kiya | Refused = service down (timeout = SG). `journalctl -u jenkins`, `/var/log/unattended-upgrades/unattended-upgrades.log`. `sudo systemctl reset-failed jenkins && sudo systemctl start jenkins`; permanent: `echo '$nrconf{override_rc}{qr(^jenkins)} = 0;' \| sudo tee /etc/needrestart/conf.d/50-jenkins.conf` |
+| `order-service` **Degraded**, pods `ImagePullBackOff` (`...:0.0.0: not found`) | GitOps mein placeholder tag `0.0.0`; Jenkins ne abhi promote nahi kiya | Expected. `DEV_APP_URL` set karke Jenkins build → `promote.sh` asli tag commit karega |
+| Jenkins admin password bhool gaye | - | `/var/lib/jenkins/init.groovy.d/reset-admin.groovy` (HudsonPrivateSecurityRealm.Details.fromPlainPassword) → restart → login → **folder turant delete** |
 
 **Debug commands jo hamesha kaam aate hain:**
 ```bash
