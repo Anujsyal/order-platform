@@ -1224,6 +1224,20 @@ Monitoring 3 layers mein hai. Har layer ek alag sawaal ka jawab deti hai:
 ```bash
 kubectl -n monitoring get secret grafana-admin -o jsonpath='{.data.admin-password}' | base64 -d; echo
 ```
+> 💡 **Screen pe dikhaye bina copy:** `... | base64 -d | clip` (Windows clipboard; Git Bash mein chalta hai). Screenshot mein password leak hone ka chance khatam. "Invalid password" aaye to aksar browser ka purana auto-fill hota hai: box khaali karke paste kar.
+>
+> **Password leak ho gaya? Rotate:**
+> ```bash
+> kubectl -n monitoring create secret generic grafana-admin --from-literal=admin-user=admin >   --from-literal=admin-password="$(openssl rand -base64 18)" --dry-run=client -o yaml | kubectl apply -f -
+> kubectl -n monitoring rollout restart deploy kube-prometheus-stack-grafana
+> ```
+> Grafana ka DB `emptyDir` mein hai, to restart pe naya DB banta hai aur admin password Secret se dobara padha jaata hai.
+
+**🧠 Kyun (interview ke liye):**
+- **Prometheus pull model:** har 15s apps ke `/metrics` se data kheenchta hai. Kahan se, ye **ServiceMonitor** batata hai (app ke saath Git mein).
+- **`rate(counter[5m])`:** counter hamesha badhta hai. `rate` = pichhle 5 min ki per-second badhat. Raw counter pe graph/alert nahi banate. Quick check: `sum(rate(orders_placed_total[5m]))` (traffic-generator ~1/s).
+- **Grafana sirf dikhata hai.** Data Prometheus ka, dashboards Git mein (`dashboards/*.json`), sidecar apne aap load karta hai.
+- **Watchdog** hamesha firing = alerting pipeline zinda hai (dead man's switch).
 
 ### G2. Slack setup (Alertmanager + Jenkins)
 
@@ -1248,12 +1262,31 @@ kubectl -n monitoring create secret generic alertmanager-slack \
 # Alertmanager pod restart kar taaki naya URL turant use ho
 kubectl -n monitoring delete pod -l app.kubernetes.io/name=alertmanager
 ```
+> 💡 **URL screen pe dikhaye bina (behtar tareeka):**
+> ```bash
+> read -rs SLACK_URL          # paste + Enter; kuch nahi dikhega (-s silent, -r backslash as-is)
+> echo "length: ${#SLACK_URL}"
+> kubectl -n monitoring create secret generic alertmanager-slack --from-literal=webhook-url="$SLACK_URL" >   --dry-run=client -o yaml | kubectl apply -f -
+> unset SLACK_URL
+> ```
+> `--from-literal='https://...'` seedha likhne se URL terminal aur bash history mein reh jaata hai.
+>
+> `Warning: ... missing the kubectl.kubernetes.io/last-applied-configuration annotation`: harmless. Secret `kubectl create` se bana tha; apply khud annotation jod deta hai.
+>
+> **Check delivery:** Prometheus mein `sum(alertmanager_notifications_total{integration="slack"})` badhna chahiye aur `sum(alertmanager_notifications_failed_total{integration="slack"})` = 0. Pehle messages aksar `AlertmanagerFailedToSendAlerts` hote hain (placeholder URL wale time ke); thodi der mein RESOLVED.
+>
+> Slack ka "app is ready" popup (Slack CLI, `slack login`, `slack create`) **ignore** kar: humein sirf Incoming Webhook chahiye (Go to App Settings → Incoming Webhooks).
+
 > Secret ka naam aur key (`alertmanager-slack` / `webhook-url`) exactly yahi rakhna. Alertmanager config file `/etc/alertmanager/secrets/alertmanager-slack/webhook-url` se URL padhta hai (`gitops/clusters/<env>/addons.yaml` mein `api_url_file`).
 
 **Step 3: Jenkins ko webhook de (pipeline notifications).** Manage Jenkins → Credentials → Add:
 - Kind: **Secret text**
 - Secret: `#deployments` channel ka webhook URL
 - ID: `slack-webhook` (exactly yahi)
+
+> ⚠️ Form ka title **"Add Secret text"** hona chahiye. "Username with password" mein bhara to Jenkins hint deta hai *"did you mean secret text?"*, aur Jenkinsfile ka `string(credentialsId: 'slack-webhook')` use padh nahi payega.
+>
+> **Kyun:** Secret text Jenkins mein encrypted rehta hai, aur log mein galti se print ho to bhi `****` (masking). `notifySlack()` best-effort hai (`try/catch`), to Slack down ho tab bhi deploy nahi rukta. Alag channel (`#deployment` vs `#alerts-dev`): jaankari vs action. Mix kiya to alert fatigue.
 
 Ye optional hai. Credential nahi hoga to pipeline chalti rahegi, bas log mein "Slack notification skipped" aayega.
 
@@ -1637,6 +1670,9 @@ Do tarah ka "infra" hai, aur dono dev → staging → prod jaate hain:
 | Jenkins `ERR_CONNECTION_REFUSED`, SSH chal raha | `jenkins.service` **start-limit-hit**: boot ke ~20 min baad unattended-upgrades + needrestart ne Jenkins 5+ baar restart kiya | Refused = service down (timeout = SG). `journalctl -u jenkins`, `/var/log/unattended-upgrades/unattended-upgrades.log`. `sudo systemctl reset-failed jenkins && sudo systemctl start jenkins`; permanent: `echo '$nrconf{override_rc}{qr(^jenkins)} = 0;' \| sudo tee /etc/needrestart/conf.d/50-jenkins.conf` |
 | `order-service` **Degraded**, pods `ImagePullBackOff` (`...:0.0.0: not found`) | GitOps mein placeholder tag `0.0.0`; Jenkins ne abhi promote nahi kiya | Expected. `DEV_APP_URL` set karke Jenkins build → `promote.sh` asli tag commit karega |
 | Jenkins admin password bhool gaye | - | `/var/lib/jenkins/init.groovy.d/reset-admin.groovy` (HudsonPrivateSecurityRealm.Details.fromPlainPassword) → restart → login → **folder turant delete** |
+| Grafana Availability / Error budget **"No data"**, baaki panels theek | 5xx series exist hi nahi (koi error nahi aaya); PromQL mein `sum(khaali)` = khaali, 0 nahi | Prometheus API pe rule query: `slo:sli_error:ratio_rate1h` → `[]`. Fix: SLI rules mein `(sum(rate(...5xx...)) or vector(0)) / sum(rate(...))` |
+| Abort dabaya, phir Slack: "failed post-deploy verification" + GitOps revert | Jenkinsfile `catch (err)` ne abort (`FlowInterruptedException`) bhi pakad liya | Console: `Sending interrupt signal to process` = abort. Fix: `catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) { throw e }` generic catch se pehle. Canary (~8–9 min) ke beech abort mat daba |
+| Gitops `git push` → `rejected (non-fast-forward)` | Jenkins ne beech mein `promote(dev)` commit kiya | `git pull --rebase && git push` (gitops repo mein do likhne wale: tu + Jenkins) |
 
 **Debug commands jo hamesha kaam aate hain:**
 ```bash
