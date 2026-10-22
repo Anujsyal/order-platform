@@ -117,6 +117,25 @@ Agar dono ek hi repo mein hote to Jenkins jab image tag commit karta, wo commit 
 
 > Is folder mein `gitops/` directory hai. Wo **alag repo** ke roop mein push hogi (B4 dekh). Main repo ka `.gitignore` usko ignore karta hai.
 
+**Repo map: kya kahan hai** (poori file-by-file detail Interview-Prep doc §19 mein):
+
+| Repo | Folder / file | Kaam |
+|---|---|---|
+| **order-platform** (Private) | `Jenkinsfile` | App pipeline: test → Docker → Trivy → push → promote dev/staging/prod (approvals, verify, auto-rollback, Slack) |
+| | `Jenkinsfile.infra` | Infra pipeline: terraform plan → conftest → apply, dev → staging → prod |
+| | `app/` | Java 21 Spring Boot order-service (`/api/orders`, `/api/version`, metrics, fault injection demo) |
+| | `terraform/` | `bootstrap` (state bucket), `stacks/shared` (VPC + Jenkins), `stacks/cluster` (1 cluster per env via tfvars), `modules/` (vpc, jenkins, k8s-cluster, cloudwatch-alarms) |
+| | `policies/` | Rego: `terraform/aws.rego` (plan pe), `kubernetes/workloads.rego` (promote se pehle) |
+| | `scripts/` | `promote.sh` (tag commit), `verify-deployment.sh` (10 lagatar OK), `rollback.sh` (git revert), `configure.sh`, `get-kubeconfig.sh` |
+| | `docs/RUNBOOKS.md` | Har alert ka runbook (Slack "Runbook" link) |
+| **order-platform-gitops** (Public) | `bootstrap/root-<env>.yaml` | App-of-apps: ek baar apply, baaki sab ye banata hai |
+| | `clusters/<env>/addons.yaml` | kube-prometheus-stack, argo-rollouts, kyverno, kyverno-policies, monitoring-config (pinned versions, sync waves) |
+| | `clusters/<env>/apps.yaml` | AppProject + order-service Application |
+| | `apps/order-service/base/` | Rollout (canary), AnalysisTemplate, Service, NetworkPolicies, PDB, ServiceMonitor, PrometheusRule (SLO), dashboard, traffic-generator |
+| | `apps/order-service/overlays/<env>/` | **Image tag** (sirf Jenkins badalta hai), replicas, prod ka slow canary |
+| | `platform/kyverno-policies/` | 5 policies; dev Audit, staging/prod Enforce |
+| | `platform/monitoring/` | Platform alerts (Argo CD, RolloutAborted, Kyverno), Argo CD scrape, overview dashboard |
+
 ### Ek important concept: Push vs Pull deployment
 
 - **Purana tareeka (push):** Jenkins `kubectl apply` karta hai cluster pe. Iske liye Jenkins ke paas cluster ka admin access chahiye, jo risky hai.
@@ -1002,6 +1021,55 @@ terraform apply -var-file=envs/dev.tfvars
 
 **~10–15 minute** lagte hain.
 
+### Option 3: VPC aur Jenkins haath se bane hain (shared stack nahi) — hamne yahi kiya (Batch 12)
+
+Part A ki tarah agar Jenkins aur VPC (default VPC) **manually** bane hain, to shared stack ki state hai hi nahi, aur cluster stack use padh nahi payega. Tab tfvars mein ye **override** variables do (set hone pe shared state padhi hi nahi jaati):
+
+```hcl
+# envs/staging.tfvars (prod same)
+worker_instance_type      = "m7i-flex.large"   # 8 GB: add-ons ~3.6 GB + app
+worker_count              = 1                  # 16 vCPU quota: Jenkins 2 + dev 6 + staging 4 + prod 4
+vpc_id                    = "vpc-xxxxxxxx"     # default VPC
+subnet_ids                = ["subnet-xxxxxxxx"]
+jenkins_security_group_id = "sg-xxxxxxxx"      # jenkins-sg (NodePorts allow → Jenkins verify)
+# alerts_topic_arn nahi diya → CloudWatch alarms banenge, email nahi
+```
+
+```bash
+# 1. Ek baar: state bucket (local state; anda-murgi: bucket abhi bana hi nahi)
+cd terraform/bootstrap
+aws sts get-caller-identity --query Arn --output text
+terraform init && terraform plan          # 5 to add: bucket, versioning, AES256, public block, ownership
+terraform apply                            # bootstrap/terraform.tfstate delete MAT karna
+
+# 2. Har env (staging, phir prod)
+cd ../stacks/cluster
+terraform init -reconfigure -backend-config=../../backend.hcl -backend-config=key=cluster/staging/terraform.tfstate
+terraform plan -var-file=envs/staging.tfvars -out=staging.tfplan   # 29 to add, 0 destroy
+terraform apply staging.tfplan                                     # saved plan = yes nahi poochta
+
+# 3. Bina SSH progress (CloudWatch Logs; Git Bash mein path conversion band)
+export MSYS_NO_PATHCONV=1
+aws logs get-log-events --log-group-name /order-platform-staging/nodes \
+  --log-stream-name <master-instance-id>/bootstrap --limit 5 --query 'events[].message'
+# → "Control plane bootstrap complete" (~3 min); worker → "Worker joined"
+
+# 4. Kubeconfig + check
+cd /e/Project2 && bash scripts/get-kubeconfig.sh staging ~/.ssh/order-platform-key.pem
+export KUBECONFIG=~/.kube/order-platform-staging
+kubectl get nodes && kubectl -n argocd get applications
+
+# 5. Jenkins: STAGING_APP_URL / PROD_APP_URL = terraform output app_url_for_jenkins (private IP)
+```
+
+| Kyun | |
+|---|---|
+| `-out` + `apply <file>` | Jo plan review kiya wahi apply; beech mein state badli to apply fail |
+| Prod plan mein `0 to destroy` | Destroy dikhe = backend abhi bhi staging pe (`-reconfigure` / key check) |
+| Har env apna SG | Dev/staging/prod network level pe alag |
+| `.terraform.lock.hcl` commit nahi | Laptop wali file mein sirf Windows hashes; Jenkins (Linux) pe fail |
+| Staging/prod order-service `ImagePullBackOff` | Placeholder `0.0.0`; Jenkins pehla promote karega tab theek |
+
 ## B7. Cluster check karna
 
 ```bash
@@ -1810,6 +1878,12 @@ Do tarah ka "infra" hai, aur dono dev → staging → prod jaate hain:
 | `kubectl` → `localhost:8080 ... actively refused` | Is terminal mein `KUBECONFIG` set nahi (kubeconfig nahi mila → purana default localhost:8080). Cluster down **nahi** | `export KUBECONFIG=~/.kube/order-platform-dev`; permanent: `~/.bashrc` mein daal |
 | `kubectl get polr -n <ns>` → "No resources found" (pod abhi bana) | PolicyReport ~10–30s baad banta hai (EphemeralReport → reports-controller) | Thoda ruk; turant ke liye `kubectl get events -n <ns> --field-selector reason=PolicyViolation` |
 | Cluster mein `kubectl patch/scale/delete` kiya, kuch second mein wapas purana | Argo CD **selfHeal** (expected) | Badlav Git mein karo. Events: `kubectl get events -n argocd --field-selector involvedObject.name=<app>` |
+| `root` app hamesha **OutOfSync** (har ~30s Synced ↔ OutOfSync), sirf `Application kyverno` diff | Kyverno chart ke PreDelete hooks → Argo CD khud `pre-delete-finalizer.argocd.argoproj.io` (+`/cleanup`) lagata hai; Git mein nahi → selfHeal hatata, controller lagata | `clusters/<env>/addons.yaml` mein kyverno Application ke `finalizers:` mein teeno likho. Check: `kubectl -n argocd get app -o custom-columns=N:.metadata.name,GEN:.metadata.generation,F:.metadata.finalizers` |
+| Pipeline "live in prod" bola, par `kubectl get rollout` → `Paused step=1` | Pehla deploy: purane (`0.0.0`) pods kabhi Ready nahi → saara traffic canary pod pe → verify ke 10 checks jaldi pass | Canary khud poora hoga (analysis chal raha hai). Fix: Jenkins Argo CD API (read-only token) se `health == Healthy` + synced revision check kare |
+| Naye cluster mein root app: `project default which does not exist` | Root app Argo CD ke `default` AppProject banne se pehle apply hui (startup race) | ~1 min ruko, Argo CD retry khud theek karta hai |
+| Cluster stack plan/init: shared state / bucket nahi mila | Shared stack kabhi apply nahi hua (VPC/Jenkins manual); state bucket nahi | B6 Option 3: bootstrap + override variables |
+| `aws logs ... --log-group-name /...` → "failed to satisfy constraint" (Git Bash) | MSYS `/...` ko Windows path bana deta hai | `export MSYS_NO_PATHCONV=1` |
+| `read -rs https://...` → "not a valid identifier" | `read -rs VAR` mein VAR **naam** hai | `read -rs SLACK_URL` → Enter → **phir** paste → Enter |
 
 **Debug commands jo hamesha kaam aate hain:**
 ```bash
