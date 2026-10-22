@@ -12,8 +12,9 @@ variable "instances" {
 }
 
 variable "sns_topic_arn" {
-  description = "Topic that receives composite alarm notifications"
+  description = "Topic that receives composite alarm notifications (null = alarms only, no notifications)"
   type        = string
+  default     = null
 }
 
 variable "cpu_threshold" {

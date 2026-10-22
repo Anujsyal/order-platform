@@ -8,7 +8,8 @@
 #    node produces one email, not five.
 
 locals {
-  prefix = "${var.name}-${var.environment}"
+  prefix  = "${var.name}-${var.environment}"
+  actions = var.sns_topic_arn == null ? [] : [var.sns_topic_arn]
 }
 
 # ---------------------------------------------------------------- per-instance alarms
@@ -86,8 +87,8 @@ resource "aws_cloudwatch_composite_alarm" "health" {
   alarm_description = "CRITICAL [${var.environment}] one or more nodes are failing EC2 status checks"
   alarm_rule        = join(" OR ", [for a in aws_cloudwatch_metric_alarm.status : "ALARM(\"${a.arn}\")"])
 
-  alarm_actions = [var.sns_topic_arn]
-  ok_actions    = [var.sns_topic_arn]
+  alarm_actions = local.actions
+  ok_actions    = local.actions
 }
 
 resource "aws_cloudwatch_composite_alarm" "pressure" {
@@ -99,8 +100,8 @@ resource "aws_cloudwatch_composite_alarm" "pressure" {
     [for a in aws_cloudwatch_metric_alarm.disk : "ALARM(\"${a.arn}\")"],
   ))
 
-  alarm_actions = [var.sns_topic_arn]
-  ok_actions    = [var.sns_topic_arn]
+  alarm_actions = local.actions
+  ok_actions    = local.actions
 
   # Don't send "high CPU" while the node is already reported as broken.
   actions_suppressor {

@@ -22,6 +22,35 @@ variable "state_bucket" {
   type        = string
 }
 
+# Optional overrides for when the shared stack was not applied (VPC and Jenkins
+# built by hand). Setting vpc_id skips the shared remote state entirely.
+variable "vpc_id" {
+  type    = string
+  default = null
+}
+
+variable "subnet_ids" {
+  type    = list(string)
+  default = null
+
+  validation {
+    condition     = var.subnet_ids == null || length(coalesce(var.subnet_ids, [])) > 0
+    error_message = "subnet_ids must not be empty."
+  }
+}
+
+variable "jenkins_security_group_id" {
+  description = "Jenkins SG allowed to reach the NodePorts (post-deploy verification)"
+  type        = string
+  default     = null
+}
+
+variable "alerts_topic_arn" {
+  description = "SNS topic for CloudWatch composite alarms; null = alarms without notifications"
+  type        = string
+  default     = null
+}
+
 variable "admin_cidr" {
   type = string
 

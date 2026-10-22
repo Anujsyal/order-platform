@@ -37,7 +37,10 @@ provider "aws" {
   }
 }
 
+# Network, Jenkins SG and alert topic normally come from the shared stack. When
+# VPC/Jenkins were built by hand (no shared state), set vpc_id & co. in tfvars.
 data "terraform_remote_state" "shared" {
+  count   = var.vpc_id == null ? 1 : 0
   backend = "s3"
   config = {
     bucket = var.state_bucket
@@ -46,14 +49,22 @@ data "terraform_remote_state" "shared" {
   }
 }
 
+locals {
+  shared                    = try(data.terraform_remote_state.shared[0].outputs, null)
+  vpc_id                    = var.vpc_id != null ? var.vpc_id : local.shared.vpc_id
+  subnet_ids                = var.vpc_id != null ? var.subnet_ids : local.shared.public_subnet_ids
+  jenkins_security_group_id = var.vpc_id != null ? var.jenkins_security_group_id : local.shared.jenkins_security_group_id
+  alerts_topic_arn          = var.vpc_id != null ? var.alerts_topic_arn : local.shared.alerts_topic_arn
+}
+
 module "cluster" {
   source = "../../modules/k8s-cluster"
 
   name                      = "${var.project}-${var.environment}"
   environment               = var.environment
-  vpc_id                    = data.terraform_remote_state.shared.outputs.vpc_id
-  subnet_ids                = data.terraform_remote_state.shared.outputs.public_subnet_ids
-  jenkins_security_group_id = data.terraform_remote_state.shared.outputs.jenkins_security_group_id
+  vpc_id                    = local.vpc_id
+  subnet_ids                = local.subnet_ids
+  jenkins_security_group_id = local.jenkins_security_group_id
   admin_cidr                = var.admin_cidr
   key_name                  = var.key_name
   master_instance_type      = var.master_instance_type
@@ -72,5 +83,5 @@ module "alarms" {
     { master = module.cluster.master_id },
     { for i, id in module.cluster.worker_ids : "worker-${i}" => id },
   )
-  sns_topic_arn = data.terraform_remote_state.shared.outputs.alerts_topic_arn
+  sns_topic_arn = local.alerts_topic_arn
 }
