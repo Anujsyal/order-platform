@@ -1912,6 +1912,16 @@ terraform destroy
 
 # State bucket (optional, tabhi jab sab khatam): prevent_destroy hata ke, bucket empty karke destroy
 ```
+
+### Hamara asli cleanup (Batch 13: dev/Jenkins manual, staging/prod Terraform)
+1. **Pehle** README ke screenshots le lo (UI tabhi tak chalte hain). Har screenshot secrets ke liye check karo; raw folder `.gitignore` mein.
+2. Prod → staging: `terraform plan -destroy -var-file=envs/<env>.tfvars` (29 resources, naam mein sahi env) → `terraform destroy`.
+3. Bache log groups hatao: `MSYS_NO_PATHCONV=1 aws logs delete-log-group --log-group-name /order-platform-<env>/k8s-audit`. CloudWatch agent destroy ke dauraan inhe **dobara bana deta hai**.
+4. Manual EC2 (dev master/workers + Jenkins): pehle `DeleteOnTermination` + termination protection check, phir Console → Terminate.
+5. SGs: `k8s-sg` **pehle**, phir `jenkins-sg` (reference ki wajah se). Phir key pair.
+6. Tokens/webhooks revoke: Docker Hub PAT, GitHub PAT + repo webhook, Slack webhooks.
+7. Sweep (read-only): EC2, volumes, snapshots, SGs, EIPs, NAT/LB, IAM roles, alarms, dashboards, log groups, S3. Doosre projects ke resources pehchaan ke chhodo.
+8. State bucket: dobara banana ho to **rakh lo** (khaali state, < $0.01/mahina). Hatana ho to S3 Console → **Empty** (saare versions) → Delete.
 Cluster stacks destroy karne se unke CloudWatch alarms, dashboards, log groups (logs ke saath) aur node IAM roles bhi hat jaate hain. SNS topic shared stack ke saath jaata hai.
 
 > Shared stack **cluster stacks se pehle** destroy mat kar. Cluster stack SNS topic ARN aur VPC shared state se padhta hai; shared pehle gaya to cluster destroy atak jayega.
