@@ -20,3 +20,6 @@ crash.log
 *.pem
 *.key
 .env
+
+# Raw screenshots (some contain secrets) - curated copies live in docs/screenshots/
+screenshot/
